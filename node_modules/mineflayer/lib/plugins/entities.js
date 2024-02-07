@@ -26,7 +26,7 @@ const entityStatusEvents = {
 }
 
 function inject (bot) {
-  const { mobs, entitiesArray } = bot.registry
+  const { mobs } = bot.registry
   const Entity = require('prismarine-entity')(bot.version)
   const Item = require('prismarine-item')(bot.version)
   const ChatMessage = require('prismarine-chat')(bot.registry)
@@ -129,33 +129,6 @@ function inject (bot) {
     if (eventName) bot.emit(eventName, entity)
   })
 
-  bot._client.on('named_entity_spawn', (packet) => {
-    // in case player_info packet was not sent before named_entity_spawn : ignore named_entity_spawn (see #213)
-    if (packet.playerUUID in bot.uuidToUsername) {
-      // spawn named entity
-      const entity = fetchEntity(packet.entityId)
-      entity.type = 'player'
-      entity.name = 'player'
-      entity.username = bot.uuidToUsername[packet.playerUUID]
-      entity.uuid = packet.playerUUID
-      entity.dataBlobs = packet.data
-      if (bot.supportFeature('fixedPointPosition')) {
-        entity.position.set(packet.x / 32, packet.y / 32, packet.z / 32)
-      } else if (bot.supportFeature('doublePosition')) {
-        entity.position.set(packet.x, packet.y, packet.z)
-      }
-      entity.yaw = conv.fromNotchianYawByte(packet.yaw)
-      entity.pitch = conv.fromNotchianPitchByte(packet.pitch)
-      entity.height = NAMED_ENTITY_HEIGHT
-      entity.width = NAMED_ENTITY_WIDTH
-      entity.metadata = parseMetadata(packet.metadata, entity.metadata)
-      if (bot.players[entity.username] !== undefined && !bot.players[entity.username].entity) {
-        bot.players[entity.username].entity = entity
-      }
-      bot.emit('entitySpawn', entity)
-    }
-  })
-
   bot.on('entityCrouch', (entity) => {
     entity.height = CROUCH_HEIGHT
   })
@@ -171,11 +144,13 @@ function inject (bot) {
     bot.emit('playerCollect', collector, collected)
   })
 
+  // What is internalId?
+  const entityDataByInternalId = Object.fromEntries(bot.registry.entitiesArray.map((e) => [e.internalId, e]))
+
   function setEntityData (entity, type, entityData) {
-    if (entityData === undefined) {
-      entityData = entitiesArray.find(entity => entity.internalId === type)
-    }
+    entityData ??= entityDataByInternalId[type]
     if (entityData) {
+      entity.type = entityData.type || 'object'
       entity.displayName = entityData.displayName
       entity.entityType = entityData.id
       entity.name = entityData.name
@@ -192,26 +167,57 @@ function inject (bot) {
     }
   }
 
-  // spawn object/vehicle on versions < 1.19, on versions > 1.19 handles all non-player entities
-  bot._client.on('spawn_entity', (packet) => {
-    const entity = fetchEntity(packet.entityId)
-    const entityData = bot.registry.entities[packet.type]
-
-    entity.type = entityData.type || 'object'
-    setEntityData(entity, packet.type, entityData)
-
+  function updateEntityPos (entity, pos) {
     if (bot.supportFeature('fixedPointPosition')) {
-      entity.position.set(packet.x / 32, packet.y / 32, packet.z / 32)
+      entity.position.set(pos.x / 32, pos.y / 32, pos.z / 32)
     } else if (bot.supportFeature('doublePosition')) {
-      entity.position.set(packet.x, packet.y, packet.z)
-    } else if (bot.supportFeature('consolidatedEntitySpawnPacket')) {
-      entity.headPitch = conv.fromNotchianPitchByte(packet.headPitch)
+      entity.position.set(pos.x, pos.y, pos.z)
     }
+    entity.yaw = conv.fromNotchianYawByte(pos.yaw)
+    entity.pitch = conv.fromNotchianPitchByte(pos.pitch)
+  }
 
-    entity.uuid = packet.objectUUID
-    entity.yaw = conv.fromNotchianYawByte(packet.yaw)
-    entity.pitch = conv.fromNotchianPitchByte(packet.pitch)
-    entity.objectData = packet.objectData
+  function addNewPlayer (entityId, uuid, pos) {
+    const entity = fetchEntity(entityId)
+    entity.type = 'player'
+    entity.name = 'player'
+    entity.username = bot.uuidToUsername[uuid]
+    entity.uuid = uuid
+    updateEntityPos(entity, pos)
+    entity.height = NAMED_ENTITY_HEIGHT
+    entity.width = NAMED_ENTITY_WIDTH
+    if (bot.players[entity.username] !== undefined && !bot.players[entity.username].entity) {
+      bot.players[entity.username].entity = entity
+    }
+    return entity
+  }
+
+  function addNewNonPlayer (entityId, uuid, entityType, pos) {
+    const entity = fetchEntity(entityId)
+    const entityData = bot.registry.entities[entityType]
+    setEntityData(entity, entityType, entityData)
+    updateEntityPos(entity, pos)
+    return entity
+  }
+
+  bot._client.on('named_entity_spawn', (packet) => {
+    // in case player_info packet was not sent before named_entity_spawn : ignore named_entity_spawn (see #213)
+    if (packet.playerUUID in bot.uuidToUsername) {
+      // spawn named entity
+      const entity = addNewPlayer(packet.entityId, packet.playerUUID, packet, packet.metadata)
+      entity.dataBlobs = packet.data // this field doesn't appear to be listed on any version
+      entity.metadata = parseMetadata(packet.metadata, entity.metadata) // 1.8
+      bot.emit('entitySpawn', entity)
+    }
+  })
+
+  // spawn object/vehicle on versions < 1.19, on versions > 1.19 handles all non-player entities
+  // on versions >= 1.20.2, this also handles player entities
+  bot._client.on('spawn_entity', (packet) => {
+    const entityData = entityDataByInternalId[packet.type]
+    const entity = entityData?.type === 'player'
+      ? addNewPlayer(packet.entityId, packet.objectUUID, packet)
+      : addNewNonPlayer(packet.entityId, packet.objectUUID, packet.type, packet)
     bot.emit('entitySpawn', entity)
   })
 
@@ -369,7 +375,7 @@ function inject (bot) {
     }
     if (bot.fireworkRocketDuration !== 0 && entity.id === bot.entity?.id && !elytraFlying) {
       bot.fireworkRocketDuration = 0
-      knownFireworks.splice(0, knownFireworks.length)
+      knownFireworks.clear()
     }
 
     if (startedFlying) {
@@ -377,28 +383,17 @@ function inject (bot) {
     }
   }
 
-  const knownFireworks = []
+  const knownFireworks = new Set()
   function handleBotUsedFireworkRocket (fireworkEntityId, fireworkInfo) {
-    if (knownFireworks.includes(fireworkEntityId)) return
-    knownFireworks.push(fireworkEntityId)
-    let flightDur = 1
-    if (fireworkInfo?.nbtData != null) {
-      let nbt = fireworkInfo.nbtData
-      if (nbt.type === 'compound' && nbt.value.Fireworks != null) {
-        nbt = nbt.value.Fireworks
-        if (nbt.type === 'compound' && nbt.value.Flight != null) {
-          nbt = nbt.value.Flight
-          if (nbt.type === 'int') {
-            flightDur += nbt.value
-          }
-        }
-      }
-    }
-    const baseDuration = 10 * flightDur
+    if (knownFireworks.has(fireworkEntityId)) return
+    knownFireworks.add(fireworkEntityId)
+    let flightDur = fireworkInfo?.nbtData?.value?.Fireworks?.value?.Flight.value ?? 1
+    if (typeof flightDur !== 'number') { flightDur = 1 }
+    const baseDuration = 10 * (flightDur + 1)
     const randomDuration = Math.floor(Math.random() * 6) + Math.floor(Math.random() * 7)
     bot.fireworkRocketDuration = baseDuration + randomDuration
 
-    bot.emit('usedFirework')
+    bot.emit('usedFirework', fireworkEntityId)
   }
 
   let fireworkEntityName
